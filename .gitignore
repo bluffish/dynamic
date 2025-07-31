@@ -1,0 +1,11 @@
+.ipynb_checkpoints/
+__pycache__/
+*.swp
+echonet.cfg
+.echonet.cfg
+*.pyc
+echonet.egg-info/
+output
+.idea
+build
+test
