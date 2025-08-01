@@ -370,7 +370,6 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                     yhat.append(mean.view(-1).to("cpu").detach().numpy())
 
                 loss = heteroscedastic_loss(mean, log_var, outcome)
-                yhat.append(mean.detach().cpu().numpy())
 
                 if train:
                     optim.zero_grad()
