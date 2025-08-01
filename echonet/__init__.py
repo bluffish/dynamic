@@ -23,6 +23,7 @@ del click
 main.add_command(utils.segmentation.run)
 main.add_command(utils.video.run)
 main.add_command(utils.eval_seg.run)
+main.add_command(utils.eval_video.run)
 
 
 __all__ = ["__version__", "config", "datasets", "main", "utils"]

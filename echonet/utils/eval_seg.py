@@ -12,6 +12,7 @@ import skimage.draw
 import torch
 import torchvision
 import tqdm
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 import echonet
 
@@ -21,7 +22,7 @@ import echonet
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--output", type=click.Path(file_okay=False), default=None)
 
-@click.option("--weights", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option("--weights_path", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--model_name", type=click.Choice(
     sorted(name for name in torchvision.models.segmentation.__dict__
            if name.islower() and not name.startswith("__") and callable(torchvision.models.segmentation.__dict__[name]))),
@@ -38,7 +39,7 @@ def run(
     output=None,
 
     model_name="deeplabv3_resnet50",
-    weights=None,
+    weights_path=None,
 
     save_video=False,
     
@@ -47,7 +48,41 @@ def run(
     device=None,
     seed=0,
 ):
-    
+    class EnsembleModel(torch.nn.Module):
+        def __init__(self, models):
+            super().__init__()
+            self.models = torch.nn.ModuleList(models)
+
+        def forward(self, x):
+            outputs = [model(x) for model in self.models]
+            out_stack = torch.stack([out['out'] for out in outputs], dim=0)
+
+            ensemble_output = {}
+            for key in outputs[0].keys():
+                ensemble_output[key] = torch.stack([out[key] for out in outputs], dim=0).mean(dim=0)
+            
+            return ensemble_output
+        
+        def softmax_entropy(self, x):
+            logit = torch.tensor(logit, dtype=torch.float32)
+
+            logits = torch.stack([logit, -logit], dim=-1)
+
+            probs = torch.softmax(logits, dim=-1)
+
+            entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+
+            return entropy.numpy() 
+        
+    def load_model(weights_path):
+        model = torchvision.models.segmentation.__dict__[model_name](pretrained=False, aux_loss=False)
+        model.classifier[-1] = torch.nn.Conv2d(model.classifier[-1].in_channels, 1, kernel_size=model.classifier[-1].kernel_size)
+        model = torch.nn.DataParallel(model)
+        model.to(device)
+        checkpoint = torch.load(weights_path)
+        model.load_state_dict(checkpoint['state_dict'])
+        model.eval()
+        return model
 
     def binary_softmax_entropy(logit):
         # Convert to tensor if it's not already
@@ -78,12 +113,13 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Set up model
-    model = torchvision.models.segmentation.__dict__[model_name](pretrained=False, aux_loss=False)
-    model.classifier[-1] = torch.nn.Conv2d(model.classifier[-1].in_channels, 1, kernel_size=model.classifier[-1].kernel_size)  # change number of outputs to 1
-    model = torch.nn.DataParallel(model)
-    model.to(device)
-    checkpoint = torch.load(weights)
-    model.load_state_dict(checkpoint['state_dict'])
+    weights = [f"{weights_path}/{i}/best.pt" for i in range(5)]
+    print(weights)
+
+    # === Load all models and build ensemble ===
+    models = [load_model(path) for path in weights]
+    model = EnsembleModel(models).to(device)
+    model.eval()
 
     # Compute mean and std
     mean, std = echonet.utils.get_mean_and_std(echonet.datasets.Echo(root=data_dir, split="train"))
@@ -100,7 +136,7 @@ def run(
         print(f"DATASET LENGTH: {dataset.__len__}")
         dataloader = torch.utils.data.DataLoader(dataset,
                                                     batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
-        loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, False, None, device)
+        loss, large_inter, large_union, small_inter, small_union = echonet.utils.eval_seg.run_epoch(model, dataloader, False, None, device)
 
         overall_dice = 2 * (large_inter + small_inter) / (large_union + large_inter + small_union + small_inter)
         large_dice = 2 * large_inter / (large_union + large_inter)
@@ -242,6 +278,140 @@ def run(
 
                         # Move to next video
                         start += offset
+
+
+def run_epoch(model, dataloader, train, optim, device):
+    """Run one epoch of training/evaluation for segmentation.
+
+    Args:
+        model (torch.nn.Module): Model to train/evaulate.
+        dataloder (torch.utils.data.DataLoader): Dataloader for dataset.
+        train (bool): Whether or not to train model.
+        optim (torch.optim.Optimizer): Optimizer
+        device (torch.device): Device to run on
+    """
+    total = 0.
+    n = 0
+
+    pos = 0
+    neg = 0
+    pos_pix = 0
+    neg_pix = 0
+
+    model.train(train)
+
+    large_inter = 0
+    large_union = 0
+    small_inter = 0
+    small_union = 0
+    large_inter_list = []
+    large_union_list = []
+    small_inter_list = []
+    small_union_list = []
+
+    # For misclassification detection
+    all_entropy = []
+    all_misclassified = []
+
+    def binary_softmax_entropy(logit):
+        # logit: (B, H, W)
+        logits = torch.stack([logit, -logit], dim=-1)  # (B, H, W, 2)
+        probs = torch.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)  # (B, H, W)
+        return entropy
+
+    with torch.set_grad_enabled(train):
+        with tqdm.tqdm(total=len(dataloader)) as pbar:
+            for (_, (large_frame, small_frame, large_trace, small_trace)) in dataloader:
+                # Count number of pixels in/out of human segmentation
+                pos += (large_trace == 1).sum().item()
+                pos += (small_trace == 1).sum().item()
+                neg += (large_trace == 0).sum().item()
+                neg += (small_trace == 0).sum().item()
+
+                pos_pix += (large_trace == 1).sum(0).to("cpu").detach().numpy()
+                pos_pix += (small_trace == 1).sum(0).to("cpu").detach().numpy()
+                neg_pix += (large_trace == 0).sum(0).to("cpu").detach().numpy()
+                neg_pix += (small_trace == 0).sum(0).to("cpu").detach().numpy()
+
+                # === Large frames ===
+                large_frame = large_frame.to(device)
+                large_trace = large_trace.to(device)
+                y_large = model(large_frame)["out"]
+                loss_large = torch.nn.functional.binary_cross_entropy_with_logits(y_large[:, 0, :, :], large_trace, reduction="sum")
+
+                pred_large = (y_large[:, 0, :, :] > 0).float()
+                correct_large = (pred_large == large_trace).float()
+                entropy_large = binary_softmax_entropy(y_large[:, 0, :, :])
+
+                all_entropy.append(entropy_large.detach().cpu().numpy().flatten())
+                all_misclassified.append((1 - correct_large).detach().cpu().numpy().flatten())
+
+                large_inter += np.logical_and(pred_large.detach().cpu().numpy() > 0., large_trace.detach().cpu().numpy() > 0.).sum()
+                large_union += np.logical_or(pred_large.detach().cpu().numpy() > 0., large_trace.detach().cpu().numpy() > 0.).sum()
+                large_inter_list.extend(np.logical_and(pred_large.detach().cpu().numpy() > 0., large_trace.detach().cpu().numpy() > 0.).sum((1, 2)))
+                large_union_list.extend(np.logical_or(pred_large.detach().cpu().numpy() > 0., large_trace.detach().cpu().numpy() > 0.).sum((1, 2)))
+
+                # === Small frames ===
+                small_frame = small_frame.to(device)
+                small_trace = small_trace.to(device)
+                y_small = model(small_frame)["out"]
+                loss_small = torch.nn.functional.binary_cross_entropy_with_logits(y_small[:, 0, :, :], small_trace, reduction="sum")
+
+                pred_small = (y_small[:, 0, :, :] > 0).float()
+                correct_small = (pred_small == small_trace).float()
+                entropy_small = binary_softmax_entropy(y_small[:, 0, :, :])
+
+                all_entropy.append(entropy_small.detach().cpu().numpy().flatten())
+                all_misclassified.append((1 - correct_small).detach().cpu().numpy().flatten())
+
+                small_inter += np.logical_and(pred_small.detach().cpu().numpy() > 0., small_trace.detach().cpu().numpy() > 0.).sum()
+                small_union += np.logical_or(pred_small.detach().cpu().numpy() > 0., small_trace.detach().cpu().numpy() > 0.).sum()
+                small_inter_list.extend(np.logical_and(pred_small.detach().cpu().numpy() > 0., small_trace.detach().cpu().numpy() > 0.).sum((1, 2)))
+                small_union_list.extend(np.logical_or(pred_small.detach().cpu().numpy() > 0., small_trace.detach().cpu().numpy() > 0.).sum((1, 2)))
+
+                # Training step
+                loss = (loss_large + loss_small) / 2
+                if train:
+                    optim.zero_grad()
+                    loss.backward()
+                    optim.step()
+
+                # Logging
+                total += loss.item()
+                n += large_trace.size(0)
+                p = pos / (pos + neg)
+                p_pix = (pos_pix + 1) / (pos_pix + neg_pix + 2)
+                pbar.set_postfix_str("{:.4f} ({:.4f}) / {:.4f} {:.4f}, {:.4f}, {:.4f}".format(
+                    total / n / 112 / 112,
+                    loss.item() / large_trace.size(0) / 112 / 112,
+                    -p * math.log(p) - (1 - p) * math.log(1 - p),
+                    (-p_pix * np.log(p_pix) - (1 - p_pix) * np.log(1 - p_pix)).mean(),
+                    2 * large_inter / (large_union + large_inter),
+                    2 * small_inter / (small_union + small_inter)
+                ))
+                pbar.update()
+
+    large_inter_list = np.array(large_inter_list)
+    large_union_list = np.array(large_union_list)
+    small_inter_list = np.array(small_inter_list)
+    small_union_list = np.array(small_union_list)
+
+    # === Compute AUROC and AUPR ===
+    all_entropy = np.concatenate(all_entropy)
+    all_misclassified = np.concatenate(all_misclassified)
+
+    auroc = roc_auc_score(all_misclassified, all_entropy)
+    aupr = average_precision_score(all_misclassified, all_entropy)
+
+    print(f"[Misclassification Detection] AUROC: {auroc:.4f}, AUPR: {aupr:.4f}")
+
+    return (total / n / 112 / 112,
+            large_inter_list,
+            large_union_list,
+            small_inter_list,
+            small_union_list)
+
 
 def _video_collate_fn(x):
     """Collate function for Pytorch dataloader to merge multiple videos.

@@ -105,6 +105,22 @@ def run(
         seed (int, optional): Seed for random number generator. Defaults to 0.
     """
 
+    class HeteroscedasticEFModel(torch.nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            in_features = base_model.fc.in_features
+            base_model.fc = torch.nn.Identity()
+            self.base_model = base_model
+            self.head = torch.nn.Linear(in_features, 2)  # outputs [mean, log_var]
+
+        def forward(self, x):
+            features = self.base_model(x)
+            out = self.head(features)
+            mean = out[:, 0]
+            log_var = out[:, 1]
+            return mean, log_var
+        
+
     # Seed RNGs
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -119,13 +135,13 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Set up model
-    model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
 
-    model.fc = torch.nn.Linear(model.fc.in_features, 1)
-    model.fc.bias.data[0] = 55.6
+    base_model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
+    model = HeteroscedasticEFModel(base_model)
     if device.type == "cuda":
         model = torch.nn.DataParallel(model)
     model.to(device)
+
 
     if weights is not None:
         checkpoint = torch.load(weights)
@@ -183,6 +199,7 @@ def run(
                     ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
 
                 loss, yhat, y = echonet.utils.video.run_epoch(model, dataloader, phase == "train", optim, device)
+                print(yhat.shape, y.shape)
                 f.write("{},{},{},{},{},{},{},{},{}\n".format(epoch,
                                                               phase,
                                                               loss,
@@ -282,6 +299,11 @@ def run(
                 plt.close(fig)
 
 
+def heteroscedastic_loss(mean, logvar, target):
+    precision = torch.exp(-logvar)
+    return torch.mean(precision * (mean - target) ** 2 + logvar)
+
+
 def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None):
     """Run one epoch of training/evaluation for segmentation.
 
@@ -328,20 +350,27 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                 s2 += (outcome ** 2).sum()
 
                 if block_size is None:
-                    outputs = model(X)
+                    mean, log_var = model(X)
                 else:
-                    outputs = torch.cat([model(X[j:(j + block_size), ...]) for j in range(0, X.shape[0], block_size)])
-
+                    mean_list, logvar_list = [], []
+                    for j in range(0, X.shape[0], block_size):
+                        m, lv = model(X[j:(j + block_size), ...])
+                        mean_list.append(m)
+                        logvar_list.append(lv)
+                    mean = torch.cat(mean_list, dim=0)
+                    log_var = torch.cat(logvar_list, dim=0)
+                
                 if save_all:
-                    yhat.append(outputs.view(-1).to("cpu").detach().numpy())
+                    yhat.append(mean.view(-1).to("cpu").detach().numpy())
 
                 if average:
-                    outputs = outputs.view(batch, n_clips, -1).mean(1)
+                    mean = mean.view(batch, n_clips, -1).mean(1)
 
                 if not save_all:
-                    yhat.append(outputs.view(-1).to("cpu").detach().numpy())
+                    yhat.append(mean.view(-1).to("cpu").detach().numpy())
 
-                loss = torch.nn.functional.mse_loss(outputs.view(-1), outcome)
+                loss = heteroscedastic_loss(mean, log_var, outcome)
+                yhat.append(mean.detach().cpu().numpy())
 
                 if train:
                     optim.zero_grad()
