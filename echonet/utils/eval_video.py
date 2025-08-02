@@ -7,6 +7,7 @@ import tqdm
 import matplotlib.pyplot as plt
 import sklearn.metrics
 import echonet
+from scipy.stats import spearmanr
 
 @click.command("eval_video")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
@@ -24,19 +25,42 @@ import echonet
 @click.option("--period", type=int, default=2)
 
 def run(data_dir, output, weights_path, model_name, num_workers, batch_size, device, seed, frames, period):
+
+    class HeteroscedasticEFModel(torch.nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            in_features = base_model.fc.in_features
+            base_model.fc = torch.nn.Identity()
+            self.base_model = base_model
+            self.head = torch.nn.Linear(in_features, 2)  # outputs  [mean, log_var]
+
+        def forward(self, x):
+            features = self.base_model(x)
+            out = self.head(features)
+            mean = out[:, 0]
+            log_var = out[:, 1]
+            return mean, log_var
+        
+
     class EnsembleModel(torch.nn.Module):
         def __init__(self, models):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
 
         def forward(self, x):
-            preds = [model(x) for model in self.models]
-            preds = torch.stack(preds, dim=0)  # (ensemble, batch, 1)
-            return preds.mean(dim=0), preds.var(dim=0)
+            means, log_vars = [], []
+            for model in self.models:
+                mean, log_var = model(x)
+                means.append(mean)
+                log_vars.append(log_var)
+            means = torch.stack(means, dim=0)  # (ensemble, batch)
+            log_vars = torch.stack(log_vars, dim=0)
+            return means.mean(0), means.var(0), log_vars.mean(0)  # pred, epistemic, aleatoric
+
 
     def load_model(path):
-        model = torchvision.models.video.__dict__[model_name](pretrained=False)
-        model.fc = torch.nn.Linear(model.fc.in_features, 1)
+        base = torchvision.models.video.__dict__[model_name](pretrained=False)
+        model = HeteroscedasticEFModel(base)
         model = torch.nn.DataParallel(model).to(device)
         checkpoint = torch.load(path)
         model.load_state_dict(checkpoint['state_dict'])
@@ -73,6 +97,8 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         all_preds = []
         all_vars = []
         all_targets = []
+        al_vars = []
+        ep_vars = []
 
         with torch.no_grad():
             with tqdm.tqdm(total=len(dataloader)) as pbar:
@@ -87,9 +113,12 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
 
                     x = x.view(-1, c, f, h, w)
 
-                    yhat, var = model(x)  # (clips, 1)
+                    yhat, epistemic_var, aleatoric_logvar = model(x)
                     yhat = yhat.view(-1).cpu().numpy()
                     var = var.view(-1).cpu().numpy()
+
+                    al_vars.append(torch.exp(aleatoric_logvar).view(-1).cpu().numpy())
+                    ep_vars.append(epistemic_var.view(-1).cpu().numpy())
 
                     all_preds.append(yhat)
                     all_vars.append(var)
@@ -121,3 +150,6 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         plt.tight_layout()
         plt.savefig(os.path.join(output, f"{split}_scatter.pdf"))
         plt.close(fig)
+
+        corr, _ = spearmanr(abs_errors, epistemic_vars)
+        print(f"Spearman correlation between |error| and epistemic uncertainty: {corr:.3f}")
