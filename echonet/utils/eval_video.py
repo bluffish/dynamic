@@ -93,7 +93,7 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
 
     for split in ["val", "test"]:
         dataset = echonet.datasets.Echo(root=data_dir, split=split, **kwargs)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
 
         all_preds = []
         all_targets = []
