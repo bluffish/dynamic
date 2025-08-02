@@ -96,10 +96,10 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
 
         all_preds = []
-        all_vars = []
         all_targets = []
         al_vars = []
         ep_vars = []
+        abs_errors = []
 
         with torch.no_grad():
             with tqdm.tqdm(total=len(dataloader)) as pbar:
@@ -116,13 +116,12 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
 
                     yhat, epistemic_var, aleatoric_logvar = model(x)
                     yhat = yhat.view(-1).cpu().numpy()
-                    var = var.view(-1).cpu().numpy()
 
+                    abs_errors.append(np.abs(yhat.mean() - y.mean()))
                     al_vars.append(torch.exp(aleatoric_logvar).view(-1).cpu().numpy())
                     ep_vars.append(epistemic_var.view(-1).cpu().numpy())
 
                     all_preds.append(yhat)
-                    all_vars.append(var)
                     all_targets.append(y.numpy()[0])
                     pbar.update()
 
@@ -132,8 +131,6 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         r2 = sklearn.metrics.r2_score(y, yhat_mean)
         mae = sklearn.metrics.mean_absolute_error(y, yhat_mean)
         rmse = np.sqrt(sklearn.metrics.mean_squared_error(y, yhat_mean))
-
-        print(f"Variance: {np.array(all_vars).mean()}")
 
         print(f"{split} R2: {r2:.3f}, MAE: {mae:.2f}, RMSE: {rmse:.2f}")
 
@@ -152,5 +149,5 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         plt.savefig(os.path.join(output, f"{split}_scatter.pdf"))
         plt.close(fig)
 
-        corr, _ = spearmanr(abs_errors, epistemic_vars)
-        print(f"Spearman correlation between |error| and epistemic uncertainty: {corr:.3f}")
+        corr, _ = spearmanr(abs_errors, al_vars)
+        print(f"Spearman correlation between |error| and aleatoric uncertainty: {corr:.3f}")
