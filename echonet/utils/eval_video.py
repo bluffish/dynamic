@@ -23,8 +23,9 @@ from scipy.stats import spearmanr
 @click.option("--seed", type=int, default=0)
 @click.option("--frames", type=int, default=32)
 @click.option("--period", type=int, default=2)
+@click.option("--num", type=int, default=1)
 
-def run(data_dir, output, weights_path, model_name, num_workers, batch_size, device, seed, frames, period):
+def run(data_dir, output, weights_path, model_name, num_workers, batch_size, device, seed, frames, period, num):
 
     class HeteroscedasticEFModel(torch.nn.Module):
         def __init__(self, base_model):
@@ -75,7 +76,7 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
 
     os.makedirs(output, exist_ok=True)
 
-    weight_paths = [os.path.join(weights_path, f"{i}/best.pt") for i in range(5)]
+    weight_paths = [os.path.join(weights_path, f"{i}/best.pt") for i in range(num)]
     models = [load_model(p) for p in weight_paths]
     model = EnsembleModel(models).to(device)
 
