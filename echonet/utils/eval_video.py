@@ -88,7 +88,7 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
         "std": std,
         "length": frames,
         "period": period,
-        "clips": "all"
+        # "clips": "all"
     }
 
     for split in ["val", "test"]:
@@ -107,7 +107,7 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
                     x = x.to(device)  # (1, clips, C, F, H, W)
                     # print(x.shape)
 
-                    if kwargs['clips'] == 'all':
+                    if 'clips' in kwargs and kwargs['clips'] == 'all':
                         b, c, f, h, w = x.shape[1:]
                     else:
                         b, c, f, h, w = x.shape
@@ -116,6 +116,11 @@ def run(data_dir, output, weights_path, model_name, num_workers, batch_size, dev
 
                     yhat, epistemic_var, aleatoric_logvar = model(x)
                     yhat = yhat.view(-1).cpu().numpy()
+
+                    print(yhat)
+                    print(y)
+                    print(torch.exp(aleatoric_logvar))
+                    print("-----")
 
                     abs_errors.append(np.abs(yhat.mean() - y.mean()))
                     al_vars.append(torch.exp(aleatoric_logvar).view(-1).cpu().numpy())
